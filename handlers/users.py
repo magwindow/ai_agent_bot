@@ -1,12 +1,15 @@
 import os
 import httpx
+from time import sleep
 from aiogram import Router, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
 from content import cards
-from data_storage import user_states, awaiting_question
+from data_storage import user_states, awaiting_question, user_test_states, user_card_messages
 from keyboards.reply_keyboard import keyboard
+from request import send_next_test_question
+from tests import tests
 
 load_dotenv()
 
@@ -27,25 +30,52 @@ async def save_user_info(message: Message):
     # Тут можно сохранить в файл или БД
     user_states[message.chat.id] = 1
     await message.answer("Спасибо! Начнём обучение 🔧", reply_markup=keyboard)
-    await message.answer(cards[0])
+    sleep(2)
+
+    msg = await message.answer(cards[0], reply_markup=keyboard)
+    from data_storage import user_card_messages
+    user_card_messages.setdefault(message.chat.id, []).append(msg.message_id)
 
 
 @router_users.message(F.text == "➡ Дальше")
 async def next_card(message: Message):
+    await message.delete()
     idx = user_states.get(message.chat.id, 1)
     if idx < len(cards):
-        await message.answer(cards[idx], reply_markup=keyboard)
+        msg = await message.answer(cards[idx], reply_markup=keyboard)
+        # Сохраняем ID карточки
+        user_card_messages.setdefault(message.chat.id, []).append(msg.message_id)
         user_states[message.chat.id] = idx + 1
     else:
         await message.answer("✅ Вы прошли все карточки!")
 
+    # Если после этой карточки есть тест — запускаем его
+    if idx + 1 in tests:
+        # Удаляем все сообщения карточек
+        for msg_id in user_card_messages.get(message.chat.id, []):
+            try:
+                await message.bot.delete_message(message.chat.id, msg_id)
+            except Exception as e:
+                print(f"⚠️ Не удалось удалить сообщение: {e}")
+        user_card_messages[message.chat.id] = []  # Очищаем список
+        user_test_states[message.chat.id] = {
+            "index": 0,
+            "score": 0,
+            "next_card_index": idx + 1  # ← продолжим отсюда
+        }
+        await message.answer("🧪 Время пройти мини-тест по теме!")
+        await send_next_test_question(message.chat.id, message)
+
 
 @router_users.message(F.text == "⬅ Назад")
 async def prev_card(message: Message):
+    await message.delete()
     idx = user_states.get(message.chat.id, 1)
     if idx > 1:
+        msg = await message.answer(cards[idx - 2], reply_markup=keyboard)
+        # Сохраняем ID карточки
+        user_card_messages.setdefault(message.chat.id, []).append(msg.message_id)
         user_states[message.chat.id] = idx - 1
-        await message.answer(cards[idx - 2], reply_markup=keyboard)
     else:
         await message.answer("Это первая карточка.")
 
@@ -93,3 +123,22 @@ async def handle_question(message: Message):
     except Exception as e:
         await message.answer("❌ Ошибка при запросе к Groq API.")
         print(f"Groq API error: {e}")
+
+
+@router_users.message(lambda msg: msg.chat.id in user_test_states)
+async def handle_test_answer(message: Message):
+    state = user_test_states[message.chat.id]
+    test = tests[user_states[message.chat.id]]
+    current = test[state["index"]]
+    try:
+        selected_index = int(message.text.strip()) - 1
+        selected = current["options"][selected_index]
+    except:
+        await message.answer("Пожалуйста, введите номер ответа, например: 1")
+        return
+
+    if selected == current["answer"]:
+        state["score"] += 1
+
+    state["index"] += 1
+    await send_next_test_question(message.chat.id, message)
